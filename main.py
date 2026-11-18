@@ -2,13 +2,16 @@ import tkinter as tk
 from tkinter import messagebox
 import csv
 import sys
+import os
 
-INPUT_FILE  = "data.txt"
-OUTPUT_FILE = "result.csv"
-AUTO_SAVE   = True   # True — сохранять каждую запись сразу в файл
+INPUT_FILE    = "data.txt"
+OUTPUT_FILE   = "result.csv"
+REJECTED_FILE = "rejected.csv"
+AUTO_SAVE     = True
+HEADER = ["слово", "значение_слова", "синоним", "значение_синонима"]
 
 
-# ---------- загрузка ----------
+# ---------- загрузка исходных данных ----------
 def load_data(path):
     groups, order = {}, []
     with open(path, encoding="utf-8") as f:
@@ -31,15 +34,52 @@ def load_data(path):
     return [(k, groups[k]) for k in order]
 
 
-# ---------- одна строка с галочкой ----------
+# ---------- работа с csv ----------
+def read_csv_rows(path):
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return []
+    with open(path, encoding="utf-8", newline="") as f:
+        reader = csv.reader(f, delimiter=";")
+        next(reader, None)                       # пропустить заголовок
+        return [row for row in reader if row and any(c.strip() for c in row)]
+
+
+def ensure_header(path):
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            csv.writer(f, delimiter=";").writerow(HEADER)
+
+
+def append_row(path, row):
+    with open(path, "a", encoding="utf-8", newline="") as f:
+        csv.writer(f, delimiter=";").writerow(row)
+
+
+def write_all(path, rows):
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f, delimiter=";")
+        w.writerow(HEADER)
+        for r in rows:
+            w.writerow(r)
+
+
+def load_processed_keys():
+    """Все (слово, значение, синоним), которые уже есть в любом из итоговых файлов."""
+    keys = set()
+    for path in (OUTPUT_FILE, REJECTED_FILE):
+        for row in read_csv_rows(path):
+            if len(row) >= 3:
+                keys.add((row[0], row[1], row[2]))
+    return keys
+
+
+# ---------- строка с галочкой ----------
 class OptionRow(tk.Frame):
     def __init__(self, parent, text, index, callback, font_size):
-        super().__init__(parent, bg="white", relief="groove", bd=2,
-                         cursor="hand2")
-        self.index    = index
+        super().__init__(parent, bg="white", relief="groove", bd=2, cursor="hand2")
+        self.index = index
         self.callback = callback
         self.selected = False
-
         pad = max(6, font_size // 3)
 
         self.box = tk.Label(self, text="☐", font=("Arial", font_size),
@@ -58,10 +98,11 @@ class OptionRow(tk.Frame):
             w.bind("<Leave>", self.on_leave)
 
     def on_click(self, _):
-        if not self.selected:
+        if self.selected:
+            return
+        if self.callback(self.index):           # callback вернул True — выбор принят
             self.selected = True
             self.box.config(text="☑")
-            self.callback(self.index)
 
     def set_wraplength(self, wl):
         self.label.config(wraplength=wl)
@@ -81,14 +122,27 @@ class OptionRow(tk.Frame):
 
 # ---------- основное приложение ----------
 class App:
-    def __init__(self, root, items, auto_save):
+    def __init__(self, root, items, auto_save, skipped=0, total=0):
         self.root = root
         self.items = items
         self.idx = 0
-        self.results = []
         self.auto_save = auto_save
         self.transitioning = False
         self._resize_job = None
+        self.skipped = skipped
+        self.total = total or len(items)
+
+        if auto_save:
+            ensure_header(OUTPUT_FILE)
+            ensure_header(REJECTED_FILE)
+            self.results = []
+            self.rejected = []
+        else:
+            self.results = read_csv_rows(OUTPUT_FILE)
+            self.rejected = read_csv_rows(REJECTED_FILE)
+
+        self.new_choices = 0
+        self.new_rejected = 0
 
         self.header = tk.Label(root, font=("Arial", 14, "bold"),
                                anchor="w", justify="left", bg="#eef")
@@ -108,13 +162,10 @@ class App:
         btn.pack(fill="x", padx=10, pady=8)
         tk.Button(btn, text="Пропустить синоним", font=("Arial", 11),
                   command=self.skip).pack(side="left")
+        tk.Button(btn, text="Нет верного варианта", font=("Arial", 11),
+                  command=self.reject).pack(side="left", padx=6)
         tk.Button(btn, text="Завершить и сохранить", font=("Arial", 11),
                   command=self.finish).pack(side="right")
-
-        if self.auto_save:
-            with open(OUTPUT_FILE, "w", encoding="utf-8", newline="") as f:
-                csv.writer(f, delimiter=";").writerow(
-                    ["слово", "значение_слова", "синоним", "значение_синонима"])
 
         root.bind("<Configure>", self.on_resize)
         self.render()
@@ -153,8 +204,11 @@ class App:
         self.subheader.config(text=f"Синоним: {syn}",
                               font=("Arial", max(10, int(fs * 0.8))),
                               wraplength=width - 30)
-        self.progress.config(text=f"{self.idx + 1} из {len(self.items)}",
-                             font=("Arial", max(9, fs // 2)))
+        done = self.skipped + self.idx
+        self.progress.config(
+            text=(f"{done + 1} из {self.total}"
+                  f"  (уже обработано ранее: {self.skipped})"),
+            font=("Arial", max(9, fs // 2)))
 
         wraplength = max(200, width - fs * 4)
         for i, v in enumerate(values):
@@ -162,21 +216,35 @@ class App:
             row.pack(fill="x", anchor="w", pady=4, padx=4)
             row.set_wraplength(wraplength)
 
-    # -------- выбор --------
+    # -------- действия --------
     def on_select(self, i):
+        if self.transitioning:
+            return False
+        self.transitioning = True
+        (word, meaning, syn), values = self.items[self.idx]
+        row = [word, meaning, syn, values[i]]
+        if self.auto_save:
+            append_row(OUTPUT_FILE, row)
+        else:
+            self.results.append(row)
+        self.new_choices += 1
+        self.idx += 1
+        self.root.after(300, self._advance)
+        return True
+
+    def reject(self):
         if self.transitioning:
             return
         self.transitioning = True
-        (word, meaning, syn), values = self.items[self.idx]
-        row_data = [word, meaning, syn, values[i]]
-        self.results.append(row_data)
-
+        (word, meaning, syn), _ = self.items[self.idx]
+        row = [word, meaning, syn, ""]
         if self.auto_save:
-            with open(OUTPUT_FILE, "a", encoding="utf-8", newline="") as f:
-                csv.writer(f, delimiter=";").writerow(row_data)
-
+            append_row(REJECTED_FILE, row)
+        else:
+            self.rejected.append(row)
+        self.new_rejected += 1
         self.idx += 1
-        self.root.after(300, self._advance)
+        self.root.after(150, self._advance)
 
     def _advance(self):
         self.transitioning = False
@@ -191,18 +259,17 @@ class App:
 
     # -------- завершение --------
     def finish(self):
-        if not self.auto_save and self.results:
-            with open(OUTPUT_FILE, "w", encoding="utf-8", newline="") as f:
-                w = csv.writer(f, delimiter=";")
-                w.writerow(["слово", "значение_слова", "синоним",
-                            "значение_синонима"])
-                for r in self.results:
-                    w.writerow(r)
+        if not self.auto_save:
+            write_all(OUTPUT_FILE, self.results)
+            write_all(REJECTED_FILE, self.rejected)
 
-        extra = " (по ходу)" if self.auto_save else ""
-        messagebox.showinfo("Готово",
-                            f"Обработано записей: {len(self.results)}\n"
-                            f"Файл: {OUTPUT_FILE}{extra}")
+        msg = (f"Обработано в этой сессии:\n"
+               f"  выбрано значений: {self.new_choices}\n"
+               f"  отмечено «нет верного варианта»: {self.new_rejected}\n\n"
+               f"Файлы:\n"
+               f"  {OUTPUT_FILE} — выбранные значения\n"
+               f"  {REJECTED_FILE} — без верного варианта")
+        messagebox.showinfo("Готово", msg)
         self.root.destroy()
 
 
@@ -210,23 +277,31 @@ class App:
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else INPUT_FILE
     try:
-        items = load_data(path)
+        all_items = load_data(path)
     except FileNotFoundError:
         root = tk.Tk(); root.withdraw()
         messagebox.showerror("Ошибка", f"Файл не найден: {path}")
         return
 
+    total = len(all_items)
+    processed = load_processed_keys()
+    items = [it for it in all_items if it[0] not in processed]
+    skipped = total - len(items)
+
     if not items:
         root = tk.Tk(); root.withdraw()
-        messagebox.showinfo("Пусто", "Нет данных для обработки.")
+        messagebox.showinfo(
+            "Готово",
+            f"Все {total} записей уже обработаны.\n"
+            f"Чтобы начать заново — удалите {OUTPUT_FILE} и {REJECTED_FILE}.")
         return
 
     root = tk.Tk()
     root.title("Выбор значений синонимов")
     root.geometry("900x600")
     root.minsize(500, 400)
-    root.update_idletasks()      # чтобы при первом render winfo_width() был реальный
-    App(root, items, AUTO_SAVE)
+    root.update_idletasks()
+    App(root, items, AUTO_SAVE, skipped=skipped, total=total)
     root.mainloop()
 
 
