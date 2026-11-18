@@ -10,8 +10,12 @@ REJECTED_FILE = "rejected.csv"
 AUTO_SAVE     = True
 HEADER = ["слово", "значение_слова", "синоним", "значение_синонима"]
 
+BTN_FONT = ("Arial", 13, "bold")
+BTN_PADX = 14
+BTN_PADY = 10
 
-# ---------- загрузка исходных данных ----------
+
+# ---------- данные ----------
 def load_data(path):
     groups, order = {}, []
     with open(path, encoding="utf-8") as f:
@@ -34,13 +38,12 @@ def load_data(path):
     return [(k, groups[k]) for k in order]
 
 
-# ---------- работа с csv ----------
 def read_csv_rows(path):
     if not os.path.exists(path) or os.path.getsize(path) == 0:
         return []
     with open(path, encoding="utf-8", newline="") as f:
         reader = csv.reader(f, delimiter=";")
-        next(reader, None)                       # пропустить заголовок
+        next(reader, None)
         return [row for row in reader if row and any(c.strip() for c in row)]
 
 
@@ -64,7 +67,6 @@ def write_all(path, rows):
 
 
 def load_processed_keys():
-    """Все (слово, значение, синоним), которые уже есть в любом из итоговых файлов."""
     keys = set()
     for path in (OUTPUT_FILE, REJECTED_FILE):
         for row in read_csv_rows(path):
@@ -73,7 +75,7 @@ def load_processed_keys():
     return keys
 
 
-# ---------- строка с галочкой ----------
+# ---------- строка-вариант ----------
 class OptionRow(tk.Frame):
     def __init__(self, parent, text, index, callback, font_size):
         super().__init__(parent, bg="white", relief="groove", bd=2, cursor="hand2")
@@ -100,7 +102,7 @@ class OptionRow(tk.Frame):
     def on_click(self, _):
         if self.selected:
             return
-        if self.callback(self.index):           # callback вернул True — выбор принят
+        if self.callback(self.index):
             self.selected = True
             self.box.config(text="☑")
 
@@ -120,7 +122,7 @@ class OptionRow(tk.Frame):
             w.config(bg=color)
 
 
-# ---------- основное приложение ----------
+# ---------- приложение ----------
 class App:
     def __init__(self, root, items, auto_save, skipped=0, total=0):
         self.root = root
@@ -131,6 +133,7 @@ class App:
         self._resize_job = None
         self.skipped = skipped
         self.total = total or len(items)
+        self.current_fs = None
 
         if auto_save:
             ensure_header(OUTPUT_FILE)
@@ -144,51 +147,126 @@ class App:
         self.new_choices = 0
         self.new_rejected = 0
 
-        self.header = tk.Label(root, font=("Arial", 14, "bold"),
-                               anchor="w", justify="left", bg="#eef")
-        self.header.pack(fill="x", padx=10, pady=(10, 2))
+        # ============ Layout ============
+        root.configure(bg="#f5f5f5")
 
-        self.subheader = tk.Label(root, font=("Arial", 12),
-                                  anchor="w", justify="left", bg="#eef")
-        self.subheader.pack(fill="x", padx=10, pady=(0, 8))
+        # 1. Кнопки — сначала, side="bottom", чтобы всегда были видны
+        btn_frame = tk.Frame(root, bg="#e0e0e0", bd=1, relief="ridge")
+        btn_frame.pack(side="bottom", fill="x", padx=10, pady=(5, 10))
 
-        self.frame = tk.Frame(root)
-        self.frame.pack(fill="both", expand=True, padx=10, pady=5)
+        tk.Button(btn_frame, text="Пропустить", font=BTN_FONT,
+                  command=self.skip, padx=BTN_PADX, pady=BTN_PADY,
+                  bg="#eeeeee").pack(side="left", padx=(8, 4), pady=6)
 
-        self.progress = tk.Label(root, font=("Arial", 10), fg="#666")
-        self.progress.pack(fill="x", padx=10)
+        tk.Button(btn_frame, text="Нет верного варианта", font=BTN_FONT,
+                  command=self.reject, padx=BTN_PADX, pady=BTN_PADY,
+                  bg="#ffd8d8").pack(side="left", padx=4, pady=6)
 
-        btn = tk.Frame(root)
-        btn.pack(fill="x", padx=10, pady=8)
-        tk.Button(btn, text="Пропустить синоним", font=("Arial", 11),
-                  command=self.skip).pack(side="left")
-        tk.Button(btn, text="Нет верного варианта", font=("Arial", 11),
-                  command=self.reject).pack(side="left", padx=6)
-        tk.Button(btn, text="Завершить и сохранить", font=("Arial", 11),
-                  command=self.finish).pack(side="right")
+        tk.Button(btn_frame, text="Завершить", font=BTN_FONT,
+                  command=self.finish, padx=BTN_PADX, pady=BTN_PADY,
+                  bg="#d8f0d8").pack(side="right", padx=(4, 8), pady=6)
+
+        # 2. Прогресс — над кнопками
+        self.progress = tk.Label(root, font=("Arial", 10), fg="#666", bg="#f5f5f5")
+        self.progress.pack(side="bottom", fill="x", padx=10, pady=(0, 2))
+
+        # 3. Заголовки — сверху
+        self.header_word = tk.Label(root, font=("Arial", 16, "bold"),
+                                    anchor="w", justify="left",
+                                    bg="#eef4ff", fg="#002244")
+        self.header_word.pack(side="top", fill="x", padx=10, pady=(10, 0))
+
+        self.header_meaning = tk.Label(root, font=("Arial", 13),
+                                       anchor="w", justify="left",
+                                       bg="#eef4ff", fg="#334455")
+        self.header_meaning.pack(side="top", fill="x", padx=10, pady=(2, 0))
+
+        self.header_syn = tk.Label(root, font=("Arial", 13, "bold"),
+                                   anchor="w", justify="left",
+                                   bg="#eef4ff", fg="#0055aa")
+        self.header_syn.pack(side="top", fill="x", padx=10, pady=(6, 6))
+
+        # 4. Прокручиваемая область с вариантами
+        container = tk.Frame(root, bg="white", relief="sunken", bd=1)
+        container.pack(side="top", fill="both", expand=True, padx=10, pady=(0, 5))
+
+        self.canvas = tk.Canvas(container, bg="white", highlightthickness=0)
+        self.scrollbar = tk.Scrollbar(container, orient="vertical",
+                                      command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        self.canvas.pack(side="left", fill="both", expand=True)
+
+        self.inner = tk.Frame(self.canvas, bg="white")
+        self.canvas_window = self.canvas.create_window((0, 0),
+                                                       window=self.inner,
+                                                       anchor="nw")
+        self.inner.bind("<Configure>", self._on_inner_configure)
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
+
+        # колесо мыши — глобально
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            root.bind_all(seq, self._on_mousewheel)
 
         root.bind("<Configure>", self.on_resize)
-        self.render()
+        root.after(10, self.render)   # первичный рендер, когда окно уже видно
 
-    # -------- масштабирование --------
+    # -------- скроллбар и прокрутка --------
+    def _on_inner_configure(self, _):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        self._toggle_scrollbar()
+
+    def _on_canvas_configure(self, e):
+        self.canvas.itemconfig(self.canvas_window, width=e.width)
+        self._toggle_scrollbar()
+
+    def _toggle_scrollbar(self):
+        bbox = self.canvas.bbox("all")
+        if not bbox:
+            return
+        content_h = bbox[3] - bbox[1]
+        view_h = self.canvas.winfo_height()
+        need = content_h > view_h + 2
+
+        if need and not self.scrollbar.winfo_ismapped():
+            self.scrollbar.pack(side="right", fill="y")
+        elif not need and self.scrollbar.winfo_ismapped():
+            self.scrollbar.pack_forget()
+            self.canvas.yview_moveto(0)
+
+    def _on_mousewheel(self, e):
+        if not self.scrollbar.winfo_ismapped():
+            return
+        if e.num == 4:
+            self.canvas.yview_scroll(-1, "units")
+        elif e.num == 5:
+            self.canvas.yview_scroll(1, "units")
+        else:
+            self.canvas.yview_scroll(int(-e.delta / 120), "units")
+
+    # -------- ресайз --------
     def on_resize(self, event):
         if event.widget is not self.root:
             return
         if self._resize_job:
             self.root.after_cancel(self._resize_job)
-        self._resize_job = self.root.after(200, self.render)
+        self._resize_job = self.root.after(200, self._maybe_rerender)
+
+    def _maybe_rerender(self):
+        self._resize_job = None
+        if self.compute_font_size() != self.current_fs:
+            self.render(keep_scroll=True)
 
     def compute_font_size(self):
         w = max(self.root.winfo_width(), 400)
-        h = max(self.root.winfo_height(), 300)
-        return max(12, min(36, min(w // 45, h // 22)))
+        return max(12, min(32, w // 45))
 
     # -------- отрисовка --------
-    def render(self):
-        self._resize_job = None
+    def render(self, keep_scroll=False):
         if self.transitioning:
             return
-        for w in self.frame.winfo_children():
+        old_scroll = self.canvas.yview()[0] if keep_scroll else 0.0
+
+        for w in self.inner.winfo_children():
             w.destroy()
         if self.idx >= len(self.items):
             self.finish()
@@ -196,25 +274,37 @@ class App:
 
         (word, meaning, syn), values = self.items[self.idx]
         fs = self.compute_font_size()
+        self.current_fs = fs
         width = max(self.root.winfo_width(), 400)
+        wrap = width - 30
 
-        self.header.config(text=f"{word}; {meaning}",
-                           font=("Arial", max(11, int(fs * 0.9)), "bold"),
-                           wraplength=width - 30)
-        self.subheader.config(text=f"Синоним: {syn}",
-                              font=("Arial", max(10, int(fs * 0.8))),
-                              wraplength=width - 30)
+        self.header_word.config(
+            text=word,
+            font=("Arial", max(14, int(fs * 1.1)), "bold"),
+            wraplength=wrap)
+        self.header_meaning.config(
+            text=meaning,
+            font=("Arial", max(11, int(fs * 0.85))),
+            wraplength=wrap)
+        self.header_syn.config(
+            text=f"Синоним: {syn}",
+            font=("Arial", max(11, int(fs * 0.85)), "bold"),
+            wraplength=wrap)
+
         done = self.skipped + self.idx
         self.progress.config(
             text=(f"{done + 1} из {self.total}"
                   f"  (уже обработано ранее: {self.skipped})"),
             font=("Arial", max(9, fs // 2)))
 
-        wraplength = max(200, width - fs * 4)
+        row_wrap = max(200, width - fs * 4 - 40)
         for i, v in enumerate(values):
-            row = OptionRow(self.frame, v, i, self.on_select, fs)
-            row.pack(fill="x", anchor="w", pady=4, padx=4)
-            row.set_wraplength(wraplength)
+            row = OptionRow(self.inner, v, i, self.on_select, fs)
+            row.pack(fill="x", anchor="w", pady=4, padx=6)
+            row.set_wraplength(row_wrap)
+
+        self.root.after_idle(lambda: self.canvas.yview_moveto(old_scroll))
+        self.root.after(10, self._toggle_scrollbar)
 
     # -------- действия --------
     def on_select(self, i):
@@ -246,16 +336,16 @@ class App:
         self.idx += 1
         self.root.after(150, self._advance)
 
-    def _advance(self):
-        self.transitioning = False
-        self.render()
-
     def skip(self):
         if self.transitioning:
             return
         self.transitioning = True
         self.idx += 1
         self.root.after(100, self._advance)
+
+    def _advance(self):
+        self.transitioning = False
+        self.render()
 
     # -------- завершение --------
     def finish(self):
@@ -267,8 +357,8 @@ class App:
                f"  выбрано значений: {self.new_choices}\n"
                f"  отмечено «нет верного варианта»: {self.new_rejected}\n\n"
                f"Файлы:\n"
-               f"  {OUTPUT_FILE} — выбранные значения\n"
-               f"  {REJECTED_FILE} — без верного варианта")
+               f"  {OUTPUT_FILE}\n"
+               f"  {REJECTED_FILE}")
         messagebox.showinfo("Готово", msg)
         self.root.destroy()
 
@@ -298,8 +388,8 @@ def main():
 
     root = tk.Tk()
     root.title("Выбор значений синонимов")
-    root.geometry("900x600")
-    root.minsize(500, 400)
+    root.geometry("950x700")
+    root.minsize(650, 450)
     root.update_idletasks()
     App(root, items, AUTO_SAVE, skipped=skipped, total=total)
     root.mainloop()
